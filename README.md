@@ -1,0 +1,69 @@
+# tickforge
+
+> A tick-level crypto market microstructure lab: a custom memory-mapped columnar engine (`.mkt`) that queries 100GB+ of Binance tick data with **<2GB RAM**, proved with drills — not vibes.
+
+**Status:** 🚧 **Phase 0 — Foundation** (repo + plan locked in)
+
+---
+
+## Problem
+
+Raw Binance tick data doesn't get treats like bars or candles — it's millions of rows/day with duplicates, out-of-order timestamps, and gaps. Batch tools pretend real-time structure doesn't exist. This repo builds the ingestion, storage, and query layer that trading systems actually face, then *proves* correctness with kill/resume, dedup, late-data, and RAM-safety drills.
+
+## Design
+
+- **Rust** (`tf-core` → `tf-format` → `tf-engine` → `tf-cli`): `.mkt` binary columnar format, `memmap2` reads, footer/index-first, `ts` range pruning.
+- **Python**: download from `data.binance.vision`, normalize → Parquet, verification vs DuckDB, drills.
+- **R** (`data.table` / `ggplot2`): one falsifiable microstructure hypothesis with effect size, not just plots.
+- **DuckDB**: sanity checker, not the storage engine.
+- **Databricks / Delta**: normalized data lands in Volumes with industry partitioning (`exchange/symbol/dt=`).
+
+Why a custom format instead of Parquet → see [`docs/ADR-0001-custom-mkt-format.md`](docs/ADR-0001-custom-mkt-format.md).
+
+## Layout
+
+```text
+tickforge/
+├── docs/           # ADRs, format spec, benchmarks
+├── rust/           # tf-core · tf-collect · tf-format · tf-engine · tf-cli
+├── python/         # download · normalize · verify · drills
+├── r/              # microstructure research + report
+└── data/           # gitignored: raw/ · norm/ · mkt/ · lake/
+```
+
+## Stack
+
+| Layer | Choice |
+|---|---|
+| Engine | Rust stable (1.99+) — `memmap2`, `zstd`, `thiserror` |
+| Glue | Python 3.11+ — `polars`, `pyarrow`, `duckdb`, `typer` |
+| Research | R 4.x — `data.table`, `zoo/xts`, `ggplot2` |
+| Lakehouse | Delta Lake → Databricks Volumes |
+
+## Proofs
+
+> The 6 must-pass drills (plan.md §7). Filled in as phases complete — no empty claims.
+
+| # | Drill | Result |
+|---|---|---|
+| 1 | Idempotent ingest (2nd run `written=0`) | ⬜ pending |
+| 2 | Kill & resume mid-write, no corruption | ⬜ pending |
+| 3 | Deduplication (`inserted=1, dupes=4`) | ⬜ pending |
+| 4 | Late/out-of-order trade lands in correct bar | ⬜ pending |
+| 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | ⬜ pending |
+| 6 | Replay integrity (1x replay bars == full-pass bars) | ⬜ pending |
+
+## Results
+
+> Benchmarks (query latency, compression ratio, rows/sec) go to [`docs/benchmarks.md`](docs/benchmarks.md) and get summarized here once real numbers exist.
+
+## Docs
+
+- [`plan.md`](plan.md) — full roadmap, phases 0–6
+- [`docs/ADR-0001-custom-mkt-format.md`](docs/ADR-0001-custom-mkt-format.md) — why not Parquet
+- `docs/format-spec.md` — coming in Phase 2
+- `docs/benchmarks.md` — coming in Phase 3
+
+## Bugs I hit
+
+> Documented failures go here — debugging skill is the point.

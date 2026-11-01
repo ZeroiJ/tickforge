@@ -1,0 +1,27 @@
+# ---- Data: never commit (plan.md §4) ----
+data/
+*.mkt
+*.parquet
+
+# ---- Rust ----
+target/
+**/*.rs.bk
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python-version
+
+# ---- R ----
+.Rhistory
+.RData
+.Rproj.user/
+.Renviron
+
+# ---- OS / IDE ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
