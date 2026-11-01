@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+# One member per phase slice — tf-collect/tf-format/tf-engine join as their phases land (plan.md).
+members = ["crates/tf-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+memmap2 = "0.9"
+zstd = "0.13"
+thiserror = "2.0"
