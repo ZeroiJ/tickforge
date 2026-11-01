@@ -115,6 +115,8 @@ Do this in vertical slices. If at any point you can't explain a file to yourself
 
 ### Phase 0: Foundation (Day 1 - 2) | Goal: Repo + Plan locked in
 
+> **Status: ✅ COMPLETE (2026-11-01)** — first commit `d9b98ee`, pushed to https://github.com/ZeroiJ/tickforge (public). Env verified: rustc 1.99.1 · python 3.15.2 · R 4.6.2 (+Rscript) · uv 0.13.6. ADR-0001 accepted. Notion/Composio brain not yet linked (`/mcps`).
+
 | Task | Action | Done when |
 |---|---|---|
 | **Init repo** | `git init`, README skeleton, `.gitignore`, folder structure above. | `git log` has first commit. |
