@@ -126,6 +126,8 @@ Do this in vertical slices. If at any point you can't explain a file to yourself
 
 ### Phase 1: Ingest & Normalize (Day 2 - 5) | Goal: Get clean tick data
 
+> **Status: ✅ COMPLETE (2026-11-01)** — downloaded + sha256-verified `BTCUSDT-aggTrades-2026-10-31` (417,528 rows, 34.45MB CSV) → canonical parquet `data/norm/btcusdt/dt=2026-10-31/trades.parquet` (4.92MB, zstd) + `stats.json`. DuckDB cross-check: counts/price-bounds/ts-range/Σqty == raw. Idempotent: 2nd run `rows_written=0`. 26 pytest contract tests green; schema lockstep `schema.rs` ↔ `schema.py` (`cargo test -p tf-core` 2/2). Spot ts are µs for ≥2025 (documented + legacy ms→µs conversion tested).
+
 | Task | Action | Done when |
 |---|---|---|
 | **Downloader** | `python/tickforge/download.py` to pull 1 day of `aggTrades` for `BTCUSDT` from `data.binance.vision`. | Zip downloaded + extracted to `data/raw/`. |

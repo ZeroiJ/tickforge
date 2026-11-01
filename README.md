@@ -2,7 +2,7 @@
 
 > A tick-level crypto market microstructure lab: a custom memory-mapped columnar engine (`.mkt`) that queries 100GB+ of Binance tick data with **<2GB RAM**, proved with drills — not vibes.
 
-**Status:** 🚧 **Phase 0 — Foundation** (repo + plan locked in)
+**Status:** 🚧 **Phase 1 — Ingest & Normalize** ✅ *(2026-11-01: first slice complete — see below)*
 
 ---
 
@@ -56,6 +56,12 @@ tickforge/
 ## Results
 
 > Benchmarks (query latency, compression ratio, rows/sec) go to [`docs/benchmarks.md`](docs/benchmarks.md) and get summarized here once real numbers exist.
+
+**First proof (Phase 1 ingest chain, 2026-10-31 · BTCUSDT · aggTrades):**
+- `data.binance.vision` zip **6.11MB** → CSV **34.45MB**, 417,528 aggregates, sha256-verified against `.CHECKSUM`
+- canonical Parquet (zstd): **4.92MB** — DuckDB-verified `count/price-bounds/ts-range/Σqty` == raw CSV
+- second normalize run: `rows_written=0` (idempotent, sha-keyed)
+- contract: timestamps **µs** (spot ≥2025), `quote_qty` derived `price*qty`, tests: 26 pytest + 2 cargo green
 
 ## Docs
 
