@@ -137,15 +137,15 @@ Do this in vertical slices. If at any point you can't explain a file to yourself
 
 ### Phase 2: Custom Columnar Format `.mkt` (Week 1 - 2) | Goal: Your engine's heart
 
-This is what'll separate you from just "data analysis" repos.
+> **Status: ✅ COMPLETE (2026-11-05)** — `docs/format-spec.md` v1 (footer-first, chunk min/max, tmp+fsync+rename atomic writes). `tf-format` writer + memmap reader: 417,528-row day round-trips **100% bitwise**; corrupted tail/payloads fail loudly (7 tests). `tf-cli ingest-norm` idempotent (2nd run `rows_written=0`), `tf-cli roundtrip` proof command. Sizes: CSV 34.45MB → `.mkt` 4.74MB (**7.6×**, in the 4–8× target band); `.mkt` 1.09× smaller than the parquet sidecar. Write≤ read: bug found by index-mismatch (missing 2-byte reserved header) — reader failed loudly by design.
 
 | Task | Action | Done when |
 |---|---|---|
-| **Spec** | Write `docs/format-spec.md`. Cover magic bytes (`TFMK`), version, footer, column sections, row groups/chunks, min/max per chunk, compression (`zstd`). | Clear enough for future-you to implement. |
-| **Writer (`tf-format`)** | In Rust: write columns separately (timestamp, price, qty, side/flags). Chunk by ~10^6 rows or fixed byte target. | `tf-cli ingest-norm --in data/norm/... --out data/mkt/` produces `.mkt`. |
-| **Reader + memmap** | Use `memmap2` to read footer/index first. Don't load whole file. | Can read just `ts` column range without deserializing price/qty. |
-| **Round-trip test** | Load `.mkt` and compare `ts,price,qty` to the Parquet source byte-for-byte by values. | 100% match on sample day. |
-| **Compression check** | Log raw vs `.mkt` size. Aim for 4-8x on trades. | Numbers in README. |
+| **Spec** | Write `docs/format-spec.md`. Cover magic bytes (`TFMK`), version, footer, column sections, row groups/chunks, min/max per chunk, compression (`zstd`). | Clear enough for future-you to implement. ✅ |
+| **Writer (`tf-format`)** | In Rust: write columns separately (timestamp, price, qty, side/flags). Chunk by ~10^6 rows or fixed byte target. | `tf-cli ingest-norm --in data/norm/... --out data/mkt/` produces `.mkt`. ✅ |
+| **Reader + memmap** | Use `memmap2` to read footer/index first. Don't load whole file. | Can read just `ts` column range without deserializing price/qty. ✅ (`chunks_for_ts_range` skips by stored min/max without reading payloads) |
+| **Round-trip test** | Load `.mkt` and compare `ts,price,qty` to the Parquet source byte-for-byte by values. | 100% match on sample day. ✅ (all 6 columns) |
+| **Compression check** | Log raw vs `.mkt` size. Aim for 4-8x on trades. | Numbers in README. ✅ (7.6×, `docs/benchmarks.md`) |
 
 *Tip*: Look at how Vortex does per-column encodings conceptually. You don't need dictionary+RLE+frame-of-reference all at once. **Dictionary + run-length for bools + plain + zstd is more than enough to start.**
 

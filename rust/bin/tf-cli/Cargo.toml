@@ -1,0 +1,19 @@
+[package]
+name = "tf-cli"
+version = "0.1.0"
+edition = "2024"
+description = "tickforge CLI — ingest-norm (parquet -> .mkt), roundtrip proofs, later: query/replay/bench"
+
+[[bin]]
+name = "tf-cli"
+path = "src/main.rs"
+
+[dependencies]
+tf-core = { path = "../../crates/tf-core" }
+tf-format = { path = "../../crates/tf-format" }
+arrow-array = "58"
+clap = { version = "4", features = ["derive"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "zstd"] }
+sha2 = "0.10"
+anyhow = "1"
+serde_json = "1"

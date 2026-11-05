@@ -2,7 +2,7 @@
 
 > A tick-level crypto market microstructure lab: a custom memory-mapped columnar engine (`.mkt`) that queries 100GB+ of Binance tick data with **<2GB RAM**, proved with drills — not vibes.
 
-**Status:** 🚧 **Phase 1 — Ingest & Normalize** ✅ *(2026-11-01: first slice complete — see below)*
+**Status:** 🚧 **Phase 2 — `.mkt` engine format** ✅ *(2026-11-05: format spec v1, writer+memmap reader, ingest & round-trip proofs — see Results)*
 
 ---
 
@@ -46,12 +46,12 @@ tickforge/
 
 | # | Drill | Result |
 |---|---|---|
-| 1 | Idempotent ingest (2nd run `written=0`) | ⬜ pending |
-| 2 | Kill & resume mid-write, no corruption | ⬜ pending |
-| 3 | Deduplication (`inserted=1, dupes=4`) | ⬜ pending |
-| 4 | Late/out-of-order trade lands in correct bar | ⬜ pending |
-| 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | ⬜ pending |
-| 6 | Replay integrity (1x replay bars == full-pass bars) | ⬜ pending |
+| 1 | Idempotent ingest (2nd run `written=0`) | ✅ `tf-cli ingest-norm` ×2 → 2nd run `rows_written=0` (sha-keyed skip) |
+| 2 | Kill & resume mid-write, no corruption | 🚧 designed for (atomic tmp+fsync+rename; footer-last), drill run pending Phase 3 |
+| 3 | Deduplication (`inserted=1, dupes=4`) | ⬜ pending Phase 3 |
+| 4 | Late/out-of-order trade lands in correct bar | ⬜ pending Phase 3 |
+| 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | ⬜ pending Phase 3 |
+| 6 | Replay integrity (1x replay bars == full-pass bars) | ⬜ pending Phase 3 |
 
 ## Results
 
@@ -63,12 +63,18 @@ tickforge/
 - second normalize run: `rows_written=0` (idempotent, sha-keyed)
 - contract: timestamps **µs** (spot ≥2025), `quote_qty` derived `price*qty`, tests: 26 pytest + 2 cargo green
 
+**Phase 2 (2026-11-05 · custom `.mkt` format):**
+- first `.mkt` ingest: CSV 34.45MB → **4.74MB** `.mkt` (**7.6×**), 417,528 rows, `tf-cli ingest-norm`
+- round-trip: `.mkt` decoded → **100% bitwise match** vs Parquet across all 6 columns (`tf-cli roundtrip`)
+- correctness stack: 7 format tests (multi-chunk round trip, byte-deterministic rewrite, corrupted magic/footer/payload all fail loudly) + 26 pytest + 2 core-crate tests
+- docs: [`format-spec.md`](docs/format-spec.md) v1 · [`benchmarks.md`](docs/benchmarks.md)
+
 ## Docs
 
 - [`plan.md`](plan.md) — full roadmap, phases 0–6
 - [`docs/ADR-0001-custom-mkt-format.md`](docs/ADR-0001-custom-mkt-format.md) — why not Parquet
-- `docs/format-spec.md` — coming in Phase 2
-- `docs/benchmarks.md` — coming in Phase 3
+- [`docs/format-spec.md`](docs/format-spec.md) — `.mkt` v1 byte-level spec
+- [`docs/benchmarks.md`](docs/benchmarks.md) — sizes, ratios, drill numbers
 
 ## Bugs I hit
 

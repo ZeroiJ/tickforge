@@ -1,0 +1,11 @@
+[package]
+name = "tf-format"
+version = "0.1.0"
+edition = "2024"
+description = "tickforge custom .mkt columnar format — writer + memmap footer-first reader (docs/format-spec.md)"
+
+[dependencies]
+tf-core = { path = "../tf-core" }
+memmap2 = { workspace = true }
+zstd = { workspace = true }
+thiserror = { workspace = true }
