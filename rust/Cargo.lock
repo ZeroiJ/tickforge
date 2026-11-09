@@ -804,17 +804,27 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-schema",
  "clap",
  "parquet",
  "serde_json",
  "sha2",
  "tf-core",
+ "tf-engine",
  "tf-format",
 ]
 
 [[package]]
 name = "tf-core"
 version = "0.1.0"
+
+[[package]]
+name = "tf-engine"
+version = "0.1.0"
+dependencies = [
+ "tf-core",
+ "tf-format",
+]
 
 [[package]]
 name = "tf-format"

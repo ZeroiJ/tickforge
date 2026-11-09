@@ -1,0 +1,9 @@
+[package]
+name = "tf-engine"
+version = "0.1.0"
+edition = "2024"
+description = "tickforge query engine — time-range scans with chunk pruning, OHLCV resample, dedup/order pipeline"
+
+[dependencies]
+tf-format = { path = "../tf-format" }
+tf-core = { path = "../tf-core" }

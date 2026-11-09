@@ -3,6 +3,9 @@
 //! Phase 2 surface (plan.md):
 //! - `ingest-norm`  : normalized canonical Parquet → `.mkt` (atomic, idempotent, sha-keyed)
 //! - `roundtrip`    : decode `.mkt` back and compare to Parquet values bitwise (spec §7 proof)
+//! Phase 3 surface (plan.md):
+//! - `query`        : time-range scan on `.mkt` (chunk pruning) + optional OHLCV
+//!                    resample → bars parquet (Drills 5/6 material)
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -18,6 +21,7 @@ use sha2::Digest;
 use clap::{Parser, Subcommand};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+use tf_engine::RowTable;
 use tf_format::{
     write_mkt, write_mkt_chunked, Codec, ColData, ColumnIn, MktFile,
     COL_FLAGS, COL_PRICE, COL_QTY, COL_QUOTE_QTY, COL_TRADE_ID, COL_TS,
@@ -53,6 +57,24 @@ enum Cmd {
         /// Input parquet to compare against.
         #[arg(short, long)]
         input: PathBuf,
+    },
+    /// Time-range scan + optional OHLCV resample over a `.mkt` file (Phase 3).
+    Query {
+        /// The .mkt file to scan.
+        #[arg(short, long)]
+        mkt: PathBuf,
+        /// Window start, inclusive, canonical microseconds.
+        #[arg(long)]
+        from: i64,
+        /// Window end, inclusive, canonical microseconds.
+        #[arg(long)]
+        to: i64,
+        /// Optional resample bucket SECONDS (e.g. 1 = 1s bars).
+        #[arg(long)]
+        resample: Option<u64>,
+        /// When resampling: write bars here as parquet (e.g. bars_1s.parquet).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -179,7 +201,7 @@ fn ingest_norm(input: PathBuf, out: Option<PathBuf>, chunk_rows: Option<u32>) ->
     let (_, date) = infer_symbol_date(&input)?;
 
     let sha = sha256_hex(&input)?;
-    let canon = Canonical::read(&input)?;
+    let mut canon = Canonical::read(&input)?;
     let symbol_lower = canon.symbol.to_lowercase();
 
     let out_dir = out_root.join(&symbol_lower).join(format!("dt={date}"));
@@ -199,6 +221,27 @@ fn ingest_norm(input: PathBuf, out: Option<PathBuf>, chunk_rows: Option<u32>) ->
         }
     }
 
+    // ---- Phase 3 gate: dedup + time-ordering (Drills 3 & 4, ADR-0002) -------
+    // On day-scale data (≤ ~1M rows/symbol-day) the row-table build + sort is
+    // memory-trivial and keeps the `.mkt` write path time-ascending by contract.
+    let mut rows = RowTable {
+        trade_id: canon.trade_id.clone(),
+        ts: canon.ts.clone(),
+        price: canon.price.clone(),
+        qty: canon.qty.clone(),
+        quote_qty: canon.quote_qty.clone(),
+        flags: canon.flags.clone(),
+    };
+    let (dup, kept) = tf_engine::dedup(&rows)?;
+    rows = kept;
+    let ord = rows.sort_row_ts();
+    canon.trade_id = rows.trade_id;
+    canon.ts = rows.ts;
+    canon.price = rows.price;
+    canon.qty = rows.qty;
+    canon.quote_qty = rows.quote_qty;
+    canon.flags = rows.flags;
+
     let cols = canon.columns();
     let stats = match chunk_rows {
         Some(cr) => write_mkt_chunked(&mkt_path, &canon.symbol, cols, cr)?,
@@ -216,14 +259,16 @@ fn ingest_norm(input: PathBuf, out: Option<PathBuf>, chunk_rows: Option<u32>) ->
         "ts_max": stats.ts_max,
         "mkt_bytes": stats.file_bytes,
         "uncomp_bytes": stats.uncomp_bytes,
+        "duplicates_skipped": dup.duplicates,
+        "late_events": ord.late_events,
         "format": "mkt-v1",
         "spec": "docs/format-spec.md",
     });
     serde_json::to_writer_pretty(File::create(&sidecar)?, &side)?;
 
     println!(
-        "rows_written={} chunks={} mkt_bytes={} uncomp_bytes={} out_path={}",
-        stats.rows, stats.chunks, stats.file_bytes, stats.uncomp_bytes, mkt_path.display()
+        "rows_written={} duplicates_skipped={} late_events={} chunks={} mkt_bytes={} uncomp_bytes={} out_path={}",
+        stats.rows, dup.duplicates, ord.late_events, stats.chunks, stats.file_bytes, stats.uncomp_bytes, mkt_path.display()
     );
     Ok(())
 }
@@ -334,10 +379,116 @@ fn chunk_start(f: &MktFile, col: u8, chunk: usize) -> u64 {
     f.col(col).map(|c| c.chunks[chunk].start_row).unwrap_or(0)
 }
 
+// ---- Phase 3: query + resample ----------------------------------------------
+
+fn query(
+    mkt: PathBuf,
+    from: i64,
+    to: i64,
+    resample_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let f = MktFile::open(&mkt)?;
+    let t0 = std::time::Instant::now();
+    let (sc, st) = tf_engine::scan_ts_range(&f, from, to)?;
+
+    if sc.row_count() == 0 {
+        println!(
+            "rows_emitted=0 chunks_scanned={} chunks_skipped={} elapsed_ms={}",
+            st.chunks_scanned,
+            st.chunks_skipped,
+            t0.elapsed().as_millis()
+        );
+        return Ok(());
+    }
+
+    match resample_secs {
+        None => {
+            println!(
+                "rows_emitted={} chunks_scanned={} chunks_skipped={} rows_decoded={} elapsed_ms={} ts_range=[{},{}]",
+                st.rows_emitted,
+                st.chunks_scanned,
+                st.chunks_skipped,
+                st.rows_decoded,
+                t0.elapsed().as_millis(),
+                sc.ts[0],
+                sc.ts[sc.row_count() - 1]
+            );
+        }
+        Some(secs) => {
+            let bars = tf_engine::resample(&sc, secs);
+            let wrote = if let Some(p) = &out { write_bars_parquet(p, &bars)? } else { false };
+            println!(
+                "bars={} bucket_sec={} rows_emitted={} chunks_scanned={} chunks_skipped={} elapsed_ms={} bars_range=[{},{}] bars_written={}",
+                bars.len(),
+                secs,
+                st.rows_emitted,
+                st.chunks_scanned,
+                st.chunks_skipped,
+                t0.elapsed().as_millis(),
+                bars[0].bucket_start_us,
+                bars[bars.len() - 1].bucket_start_us,
+                if wrote { "parquet" } else { "stdout-only" }
+            );
+            if out.is_none() {
+                for b in bars.iter().take(3) {
+                    println!(
+                        "bar ts={} open={} high={} low={} close={} vol={} trades={}",
+                        b.bucket_start_us, b.open, b.high, b.low, b.close, b.base_vol, b.trades
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_bars_parquet(path: &Path, bars: &[tf_engine::Bar]) -> Result<bool, Box<dyn Error>> {
+    use arrow_array::{Int64Array, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("ts_bucket", arrow_schema::DataType::Int64, false),
+        arrow_schema::Field::new("open", arrow_schema::DataType::Float64, false),
+        arrow_schema::Field::new("high", arrow_schema::DataType::Float64, false),
+        arrow_schema::Field::new("low", arrow_schema::DataType::Float64, false),
+        arrow_schema::Field::new("close", arrow_schema::DataType::Float64, false),
+        arrow_schema::Field::new("base_vol", arrow_schema::DataType::Float64, false),
+        arrow_schema::Field::new("quote_vol", arrow_schema::DataType::Float64, false),
+        arrow_schema::Field::new("trades", arrow_schema::DataType::Int64, false),
+        arrow_schema::Field::new("buy_base", arrow_schema::DataType::Float64, false),
+        arrow_schema::Field::new("sell_base", arrow_schema::DataType::Float64, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(bars.iter().map(|b| b.bucket_start_us))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.open))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.high))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.low))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.close))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.base_vol))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.quote_vol))),
+            Arc::new(Int64Array::from_iter_values(bars.iter().map(|b| b.trades as i64))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.buy_base))),
+            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.sell_base))),
+        ],
+    )?;
+
+    let file = File::create(path)?;
+    let mut w = ArrowWriter::try_new(file, schema, None)?;
+    w.write(&batch)?;
+    w.close()?;
+    Ok(true)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::IngestNorm { input, out, chunk_rows } => ingest_norm(input, out, chunk_rows),
         Cmd::Roundtrip { mkt, input } => roundtrip(mkt, input),
+        Cmd::Query { mkt, from, to, resample, out } => query(mkt, from, to, resample, out),
     }
 }
