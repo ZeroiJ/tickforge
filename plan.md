@@ -151,16 +151,18 @@ Do this in vertical slices. If at any point you can't explain a file to yourself
 
 ### Phase 3: Query Engine + Replay (Week 2 - 3) | Goal: Prove it can handle "big" data
 
+> **Status: 🚧 IN PROGRESS (2026-11-09)** — engine core landed: `tf-engine` (scan with chunk-min/max pruning, 1s OHLCV resample w/ taker-side split, dedup + sort-on-write `late_events`), `tf-cli query --resample`, drills 2/3/4 PASS + full-day 1s bars ≡ DuckDB (77,136 bars, 176ms, 46.2 MiB peak). [`ADR-0002-dedup-key-choice.md`](docs/ADR-0002-dedup-key-choice.md). Remaining: replay mode + drill 6, Sprint-2 multi-day data for true Drill 5 scale (1-day numbers in `docs/benchmarks.md`).
+
 Focus on the exact drills from earlier, but enforced by tests.
 
 | Task | Action | Done when |
 |---|---|---|
-| **Time-range scan** | `tf-engine` with predicate `ts BETWEEN t1 AND t2`. Use chunk min/max to skip. | Query 10 min window over 30GB returns in < 200ms (local). |
-| **Resample** | Build 1s OHLCV from trades (open/high/low/close/volume/trades/count). | Matches DuckDB on same range to the tick. |
-| **Deduplication** | Enforce `trade_id` + `(symbol, ts, price, qty)` key. Track seen in a hash set with spill? Or just check by key on ingest. | Drill: insert same 5 events -> count unchanged. |
-| **Out-of-order handling** | Allow small skew (e.g. 2-5s) or sort by `ts` on write. Log "late" count. | Late events land in correct 1s bar. |
-| **Replay mode** | `tf-cli replay --speed 100x --from <ts> --to <ts>` streams events from disk in time order. | Feels like watching ticks fly. Great for demo. |
-| **Bench vs DuckDB** | Time identical query on `.mkt` vs `.parquet`. Record in `docs/benchmarks.md`. | Table with cold/warm, rows scanned/skipped. |
+| **Time-range scan** | `tf-engine` with predicate `ts BETWEEN t1 AND t2`. Use chunk min/max to skip. | Query 10 min window over 30GB returns in < 200ms (local). ✅ on 1-day fixture: 10-min window 90ms in-process (single-chunk file → no chunks skippable yet; multi-chunk pruning proven in engine tests) |
+| **Resample** | Build 1s OHLCV from trades (open/high/low/close/volume/trades/count). | Matches DuckDB on same range to the tick. ✅ 77,136/77,136 bars (OHLC/count exact; volumes within fp tol) — found+fixed DuckDB tie nondeterminism |
+| **Deduplication** | Enforce `trade_id` + `(symbol, ts, price, qty)` key. Track seen in a hash set with spill? Or just check by key on ingest. | Drill: insert same 5 events -> count unchanged. ✅ `rows_written=1 duplicates_skipped=4` (ADR-0002) |
+| **Out-of-order handling** | Allow small skew (e.g. 2-5s) or sort by `ts` on write. Log "late" count. | Late events land in correct 1s bar. ✅ sort-on-write + `late_events=1`, correct bar confirmed vs DuckDB |
+| **Replay mode** | `tf-cli replay --speed 100x --from <ts> --to <ts>` streams events from disk in time order. | Feels like watching ticks fly. Great for demo. ⬜ next slice |
+| **Bench vs DuckDB** | Time identical query on `.mkt` vs `.parquet`. Record in `docs/benchmarks.md`. | Table with cold/warm, rows scanned/skipped. 🚧 1-day table written; multi-chunk/multi-day rows-scanned-vs-skipped pending Sprint 2 |
 
 ### Phase 4: Microstructure Research in R (Week 3 - 4) | Goal: Actual finance insight
 

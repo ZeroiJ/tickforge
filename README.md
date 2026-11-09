@@ -2,7 +2,7 @@
 
 > A tick-level crypto market microstructure lab: a custom memory-mapped columnar engine (`.mkt`) that queries 100GB+ of Binance tick data with **<2GB RAM**, proved with drills — not vibes.
 
-**Status:** 🚧 **Phase 2 — `.mkt` engine format** ✅ *(2026-11-05: format spec v1, writer+memmap reader, ingest & round-trip proofs — see Results)*
+**Status:** 🚧 **Phase 3 — query engine + drills** ✅ *(2026-11-09: `tf-engine` crate — time-range scan, 1s OHLCV resample, dedup + late-event gate; `tf-cli query`; drills 1–5 pass — see Proofs)*
 
 ---
 
@@ -47,11 +47,11 @@ tickforge/
 | # | Drill | Result |
 |---|---|---|
 | 1 | Idempotent ingest (2nd run `written=0`) | ✅ `tf-cli ingest-norm` ×2 → 2nd run `rows_written=0` (sha-keyed skip) |
-| 2 | Kill & resume mid-write, no corruption | 🚧 designed for (atomic tmp+fsync+rename; footer-last), drill run pending Phase 3 |
-| 3 | Deduplication (`inserted=1, dupes=4`) | ⬜ pending Phase 3 |
-| 4 | Late/out-of-order trade lands in correct bar | ⬜ pending Phase 3 |
-| 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | ⬜ pending Phase 3 |
-| 6 | Replay integrity (1x replay bars == full-pass bars) | ⬜ pending Phase 3 |
+| 2 | Kill & resume mid-write, no corruption | ✅ kill mid-write → nothing at canonical path (atomic rename); rerun completes; state idempotent |
+| 3 | Deduplication (`inserted=1, dupes=4`) | ✅ 5 identical events → `rows_written=1 duplicates_skipped=4`, count unchanged (`python -m tickforge.drills`) |
+| 4 | Late/out-of-order trade lands in correct bar | ✅ late event → `late_events=1`, sole trade of its correct 1s bar; bars ≡ DuckDB |
+| 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | 🚧 1-day scale proven: full-day scan+resample peak WS **46.2 MiB**, 77,136 1s bars ≡ DuckDB; 24h/5-symbol scale pending Sprint 2 data |
+| 6 | Replay integrity (1x replay bars == full-pass bars) | ⬜ pending replay slice |
 
 ## Results
 
@@ -68,6 +68,13 @@ tickforge/
 - round-trip: `.mkt` decoded → **100% bitwise match** vs Parquet across all 6 columns (`tf-cli roundtrip`)
 - correctness stack: 7 format tests (multi-chunk round trip, byte-deterministic rewrite, corrupted magic/footer/payload all fail loudly) + 26 pytest + 2 core-crate tests
 - docs: [`format-spec.md`](docs/format-spec.md) v1 · [`benchmarks.md`](docs/benchmarks.md)
+
+**Phase 3 (2026-11-09 · query engine + drills):**
+- [`tf-engine`](rust/crates/tf-engine): time-range scan (2-level pruning: chunk min/max → row filter), 1s OHLCV resample with taker-side split, dedup (`trade_id` + payload fingerprint) and sort-on-write with `late_events` counter
+- `tf-cli query --from/--to [--resample N --out bars.parquet]`: 10-min window **90 ms**; full-day scan+resample **176 ms** → **77,136 1s bars**, peak working set **46.2 MiB**
+- bar correctness: **77,136/77,136 bars match DuckDB** — the drill exposed DuckDB's nondeterministic ties at equal-µs timestamps (1341 mismatches) → fixed with stream-order tiebreak
+- drills as code: `python -m tickforge.drills` → drills 2/3/4/5 PASS (kill-mid-write, dedup 1+4, late-correct-bar, DuckDB parity)
+- design: [`ADR-0002-dedup-key-choice.md`](docs/ADR-0002-dedup-key-choice.md) · numbers: [`benchmarks.md`](docs/benchmarks.md)
 
 ## Docs
 
