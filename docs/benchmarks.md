@@ -43,6 +43,8 @@ chunk-skip counters read `skipped=0` here; pruning behavior is proven per-chunk 
 | full-day scan + 1s OHLCV (tf-cli, in-process) | **176 ms** — 77,136 bars (≈77% of seconds have trades) |
 | full-day reference bars (DuckDB on parquet) | 139 ms |
 | 10-min window scan (`tf-cli query`) | **90 ms** in-process (**110 ms** wall incl. process spawn) — 10,834 rows |
+| full-day max-rate replay (Drill 6 integrity mode) | 417,528 events streamed; **77,136 streamed-incremental 1s bars EXACTLY equal** to full-pass `query` bars |
+| paced replay | 60s event window @100× → wall 747ms vs 593ms scheduled (`pacing_x=1.00`, 652 events) |
 | peak working set during full-day resample | **46.2 MiB** (Task-Manager-style WS sampling; <2GB target hit at 1-day scale) |
 | ingest w/ dedup+sort gate | unchanged byte-effective sizes; adds counters `duplicates_skipped`, `late_events` to stats.json |
 
@@ -54,6 +56,7 @@ chunk-skip counters read `skipped=0` here; pruning behavior is proven per-chunk 
 | 3 | dedup | ✅ 5 identical events → `rows_written=1 duplicates_skipped=4`, `.mkt` count unchanged |
 | 4 | late/out-of-order | ✅ late event (appended last, ts = −1.5s behind stream) → `late_events=1`, lands as sole trade of its correct 1s bar; bars ≡ DuckDB |
 | 5 | RAM-safe scan (bar-correctness part) | ✅ full-day 1s bars match DuckDB (OHLC/count exact); true 24h/5-symbol scale + Task Manager drill pending Sprint 2 data |
+| 6 | replay integrity (1x replay bars == full-pass bars) | ✅ max-rate replay of the full day (417,528 events, incremental aggregation) → 77,136 bars **exactly** equal full-pass bars; paced mode verified at 100× (`pacing_x=1.00`). Gaps > 10s are jumped (`gaps_skipped`) so historical replays don't stall — documented behavior, not hidden |
 
 **Bug the drill caught (documented failure):** DuckDB's `last(price ORDER BY ts)`
 is nondeterministic when several aggTrades share the same µs timestamp — first run
@@ -66,9 +69,16 @@ Commands:
 
 ```
 cargo test                # 15 tests (2 core + 7 format + 6 engine)
-python -m tickforge.drills   # drills 1–5, writes data/tmp/drills/results.json
-tf-cli query --mkt <.mkt> --from <µs> --to <µs> [--resample 1 --out bars.parquet]
+python -m tickforge.drills   # drills 1–6, writes data/tmp/drills/results.json
+tf-cli query  --mkt <.mkt> --from <µs> --to <µs> [--resample 1 --out bars.parquet]
+tf-cli replay --mkt <.mkt> --from <µs> --to <µs> [--speed 100] [--resample 1 --out bars.parquet]
 ```
+
+**Replay pacing bug (self-caught):** the first drill-6 run reported `wall=0ms` while
+claiming `pacing_x=1.00` — `sleep_for()` computed pacing durations but *never slept*
+(unit-name confusion: it returned a Duration used only as an accumulator). The drill
+caught it because wall-time was asserted, not the fabricated ratio. Now threads really
+sleep; wall (747ms) ≈ scheduled (593ms) at 100× + per-call sleep quantum overhead.
 
 Honest note: DuckDB still beats `tf-cli` end-to-end on this whole-file resample
 (139ms vs 176ms) — it uses parquet statistics and multithreading. `tf-cli`'s edge

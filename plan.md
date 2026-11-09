@@ -161,7 +161,7 @@ Focus on the exact drills from earlier, but enforced by tests.
 | **Resample** | Build 1s OHLCV from trades (open/high/low/close/volume/trades/count). | Matches DuckDB on same range to the tick. ✅ 77,136/77,136 bars (OHLC/count exact; volumes within fp tol) — found+fixed DuckDB tie nondeterminism |
 | **Deduplication** | Enforce `trade_id` + `(symbol, ts, price, qty)` key. Track seen in a hash set with spill? Or just check by key on ingest. | Drill: insert same 5 events -> count unchanged. ✅ `rows_written=1 duplicates_skipped=4` (ADR-0002) |
 | **Out-of-order handling** | Allow small skew (e.g. 2-5s) or sort by `ts` on write. Log "late" count. | Late events land in correct 1s bar. ✅ sort-on-write + `late_events=1`, correct bar confirmed vs DuckDB |
-| **Replay mode** | `tf-cli replay --speed 100x --from <ts> --to <ts>` streams events from disk in time order. | Feels like watching ticks fly. Great for demo. ⬜ next slice |
+| **Replay mode** | `tf-cli replay --speed 100x --from <ts> --to <ts>` streams events from disk in time order. | Feels like watching ticks fly. Great for demo. ✅ paced mode (60s @100× → 747ms wall vs 593ms scheduled) + max-rate integrity mode; gaps > 10s jumped (`gaps_skipped`) |
 | **Bench vs DuckDB** | Time identical query on `.mkt` vs `.parquet`. Record in `docs/benchmarks.md`. | Table with cold/warm, rows scanned/skipped. 🚧 1-day table written; multi-chunk/multi-day rows-scanned-vs-skipped pending Sprint 2 |
 
 ### Phase 4: Microstructure Research in R (Week 3 - 4) | Goal: Actual finance insight

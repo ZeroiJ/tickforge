@@ -120,6 +120,11 @@ def ingest(parquet: str, out_name: str, extra: list[str] | None = None) -> tuple
 def drill_1_idempotent_ingest() -> bool:
     print("[drill 1] idempotent ingest (real day)")
     pq = repo_root / "data" / "norm" / "btcusdt" / "dt=2026-10-31" / "trades.parquet"
+    # source-drift guard (a 3-row "canonical" file was once silently in place):
+    # the full-day scan must return exactly what the parquet holds.
+    pq_rows = pl.scan_parquet(str(pq)).select(pl.len()).collect().item()
+    ok_pre = check(pq_rows == 417528, "drill1: canonical source row sanity (417,528)",
+                   f"parquet has {pq_rows}")
     out = run_cli(
         "ingest-norm", "--input", str(pq)
     )
@@ -127,8 +132,8 @@ def drill_1_idempotent_ingest() -> bool:
     out2 = run_cli("ingest-norm", "--input", str(pq))
     ok2 = check(_kv(out2, "rows_written") == "0",
                 "drill1: 2nd run must be rows_written=0", out2)
-    print("  PASS" if ok1 and ok2 else "  (see above)")
-    return ok1 and ok2
+    print("  PASS" if ok_pre and ok1 and ok2 else "  (see above)")
+    return ok_pre and ok1 and ok2
 
 
 def drill_2_kill_and_resume() -> bool:
@@ -337,6 +342,41 @@ def drill_5_bars_vs_duckdb() -> bool:
     return ok
 
 
+def drill_6_replay_integrity() -> bool:
+    print("[drill 6] replay integrity + pacing")
+    mkt = repo_root / "data" / "mkt" / "btcusdt" / "dt=2026-10-31" / "trades.mkt"
+    st = json.loads((mkt.parent / "stats.json").read_text())
+    t1, t2 = st["ts_min"], st["ts_max"]
+
+    # (a) max-rate replay (integrity mode): streamed incremental bars must be
+    #     IDENTICAL to the full-pass `query --resample` bars.
+    bars_q = DRILL_DIR / "bars_query.parquet"
+    bars_r = DRILL_DIR / "bars_replay.parquet"
+    out_q = run_cli("query", "--mkt", str(mkt), "--from", str(t1), "--to", str(t2),
+                    "--resample", "1", "--out", str(bars_q))
+    out_r = run_cli("replay", "--mkt", str(mkt), "--from", str(t1), "--to", str(t2),
+                    "--resample", "1", "--out", str(bars_r))
+    q, r = pl.read_parquet(bars_q), pl.read_parquet(bars_r)
+    ok = check(_kv(out_r, "events") == _kv(out_q, "rows_emitted"),
+               "drill6: replayed event count == full-pass rows")
+    ok &= check(r.equals(q), "drill6: replay bars EXACTLY equal full-pass bars",
+                f"query {q.height} bars vs replay {r.height}")
+
+    # (b) paced replay actually paces: 60s of event time at 100x = ~600ms wall
+    w1, w2 = st["ts_min"] + 300 * 1_000_000, st["ts_min"] + 360 * 1_000_000
+    out_p = run_cli("replay", "--mkt", str(mkt), "--from", str(w1), "--to", str(w2),
+                    "--speed", "100")
+    wall = int(_kv(out_p, "wall_ms"))
+    slept = int(_kv(out_p, "slept_ms"))
+    ok &= check(500 <= wall <= 5000,
+                "drill6: 60s window @100x paces ~600ms", f"wall={wall}ms count")
+    ok &= check(slept > 400, "drill6: pacing sleep dominates (real pacing)",
+                f"slept={slept}ms")
+    print(f"  integrity {r.height} bars ≡ equality; paced window wall={wall}ms slept={slept}ms")
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
 def main(exit_on_fail: bool = True) -> int:
     if TF_CLI is None:
         print("tf-cli not built — run `cargo build` in rust/ first", file=sys.stderr)
@@ -348,9 +388,10 @@ def main(exit_on_fail: bool = True) -> int:
         drill_3_dedup(),
         drill_4_late_and_ofo(),
         drill_5_bars_vs_duckdb(),
+        drill_6_replay_integrity(),
     ]
     names = ["drill1_idempotent", "drill2_kill_resume", "drill3_dedup",
-             "drill4_late_ofo", "drill5_bars_vs_duckdb"]
+             "drill4_late_ofo", "drill5_bars_vs_duckdb", "drill6_replay"]
     summary = {n: bool(r) for n, r in zip(names, results)}
     (DRILL_DIR / "results.json").parent.mkdir(parents=True, exist_ok=True)
     (DRILL_DIR / "results.json").write_text(json.dumps(summary, indent=2))

@@ -2,7 +2,7 @@
 
 > A tick-level crypto market microstructure lab: a custom memory-mapped columnar engine (`.mkt`) that queries 100GB+ of Binance tick data with **<2GB RAM**, proved with drills — not vibes.
 
-**Status:** 🚧 **Phase 3 — query engine + drills** ✅ *(2026-11-09: `tf-engine` crate — time-range scan, 1s OHLCV resample, dedup + late-event gate; `tf-cli query`; drills 1–5 pass — see Proofs)*
+**Status:** 🚧 **Phase 3 — queries, drills 1–6 ✅; replay done. Remaining: Sprint-2 scale (drill 5 @ 24h/5 symbols, multi-chunk bench)** *(2026-11-09: tf-engine scan/resample/dedup, tf-cli query+replay, all six drills pass — see Proofs)*
 
 ---
 
@@ -51,7 +51,7 @@ tickforge/
 | 3 | Deduplication (`inserted=1, dupes=4`) | ✅ 5 identical events → `rows_written=1 duplicates_skipped=4`, count unchanged (`python -m tickforge.drills`) |
 | 4 | Late/out-of-order trade lands in correct bar | ✅ late event → `late_events=1`, sole trade of its correct 1s bar; bars ≡ DuckDB |
 | 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | 🚧 1-day scale proven: full-day scan+resample peak WS **46.2 MiB**, 77,136 1s bars ≡ DuckDB; 24h/5-symbol scale pending Sprint 2 data |
-| 6 | Replay integrity (1x replay bars == full-pass bars) | ⬜ pending replay slice |
+| 6 | Replay integrity (1x replay bars == full-pass bars) | ✅ full-day max-rate replay → **77,136 streamed bars exactly equal** full-pass bars; paced mode verified (100×, `pacing_x=1.00`) |
 
 ## Results
 
@@ -72,8 +72,9 @@ tickforge/
 **Phase 3 (2026-11-09 · query engine + drills):**
 - [`tf-engine`](rust/crates/tf-engine): time-range scan (2-level pruning: chunk min/max → row filter), 1s OHLCV resample with taker-side split, dedup (`trade_id` + payload fingerprint) and sort-on-write with `late_events` counter
 - `tf-cli query --from/--to [--resample N --out bars.parquet]`: 10-min window **90 ms**; full-day scan+resample **176 ms** → **77,136 1s bars**, peak working set **46.2 MiB**
+- `tf-cli replay --speed N` (max-rate integrity mode = Drill 6): streamed incremental bars **exactly equal** full-pass bars; paced 60s @100× → 747ms wall vs 593ms scheduled (self-caught: first version computed pacing but never slept — drill caught it via wall-time assertion)
 - bar correctness: **77,136/77,136 bars match DuckDB** — the drill exposed DuckDB's nondeterministic ties at equal-µs timestamps (1341 mismatches) → fixed with stream-order tiebreak
-- drills as code: `python -m tickforge.drills` → drills 2/3/4/5 PASS (kill-mid-write, dedup 1+4, late-correct-bar, DuckDB parity)
+- drills as code: `python -m tickforge.drills` → **drills 1–6 PASS** (idempotent, kill-mid-write, dedup 1+4, late-correct-bar, DuckDB parity, replay equality + pacing)
 - design: [`ADR-0002-dedup-key-choice.md`](docs/ADR-0002-dedup-key-choice.md) · numbers: [`benchmarks.md`](docs/benchmarks.md)
 
 ## Docs
@@ -86,3 +87,8 @@ tickforge/
 ## Bugs I hit
 
 > Documented failures go here — debugging skill is the point.
+
+- **Phase 2 — writer/reader 2-byte offset lag**: missing reserved header field; reader failed loudly exactly as designed.
+- **Phase 3 — DuckDB tie nondeterminism**: `last(price ORDER BY ts)` picked arbitrary rows among equal-µs aggTrades → 1341 bar mismatches vs tf bars; fixed with stream-order tiebreak (`file_row_number=true`).
+- **Phase 3 — replay pacing that never slept**: `sleep_for()` returned computed durations used only as an accumulator (`wall=0ms`, fabricated `pacing_x=1.00`); drill's wall-time assertion caught it → now really `thread::sleep`s.
+- **Phase 3 — silent source drift**: `data/norm` canonical parquet was at some point replaced by a 3-row file on disk; sha-keyed idempotency meant every downstream proof was shrinking with it. Rebuilt from the raw CSV via the Phase-1 pipeline (`normalize_day.py`, DuckDB-verified) and drill 1 now guards source row count (417,528). Lesson: idempotency checks should also assert the *source* is the expected shape.

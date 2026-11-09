@@ -76,6 +76,32 @@ enum Cmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Stream events from disk in time order (Phase 3 replay / Drill 6).
+    ///
+    /// `--speed N` paces the stream N× real time (event-d.UTC spacing / N);
+    /// omit (`--speed 0`) for max-rate integrity mode: the streamed path
+    /// aggregates bars incrementally and they must equal `query --resample`s
+    /// full-pass bars exactly.
+    Replay {
+        /// The .mkt file to replay.
+        #[arg(short, long)]
+        mkt: PathBuf,
+        /// Replay window start, inclusive, canonical microseconds.
+        #[arg(long)]
+        from: i64,
+        /// Replay window end, inclusive, canonical microseconds.
+        #[arg(long)]
+        to: i64,
+        /// Replay speed multiplier (0 = max-rate integrity run).
+        #[arg(long)]
+        speed: Option<f64>,
+        /// Optional resample bucket SECONDS while streaming (Drill 6 bars).
+        #[arg(long)]
+        resample: Option<u64>,
+        /// When resampling: write the streamed bars here as parquet.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn sha256_hex(path: &Path) -> Result<String, Box<dyn Error>> {
@@ -484,11 +510,126 @@ fn write_bars_parquet(path: &Path, bars: &[tf_engine::Bar]) -> Result<bool, Box<
     Ok(true)
 }
 
+// ---- Phase 3: replay (Drill 6) ----------------------------------------------
+
+fn replay(
+    mkt: PathBuf,
+    from: i64,
+    to: i64,
+    speed: Option<f64>,
+    resample_secs: Option<u64>,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    use std::time::{Duration, Instant};
+
+    let sp = speed.filter(|s| *s > 0.0);
+    let f = MktFile::open(&mkt)?;
+    let (sc, _st) = tf_engine::scan_ts_range(&f, from, to)?;
+
+    let bucket_us = resample_secs.unwrap_or(1).max(1) as i64 * 1_000_000;
+    let mut bars: Vec<tf_engine::Bar> = Vec::new();
+    let mut prev_ts: Option<i64> = None;
+    let mut slept = Duration::ZERO;
+    let mut gaps_skipped: u64 = 0; // silent stretches > 10s get skipped for pacing
+    let started = Instant::now();
+
+    for i in 0..sc.row_count() {
+        let ts = sc.ts[i];
+        if let Some(speed) = sp {
+            if let Some(prev) = prev_ts {
+                let gap_us = ts - prev;
+                if gap_us <= MAX_PACED_GAP_SEC * 1_000_000 {
+                    slept += sleep_for(gap_us, speed);
+                } else {
+                    // a silent stretch would stall the demo; note and jump
+                    gaps_skipped += 1;
+                }
+            }
+        }
+        prev_ts = Some(ts);
+
+        // incremental bar aggregation (must mirror tf_engine::resample exactly)
+        let bucket = ts - ts.rem_euclid(bucket_us);
+        let (buy, sell) = if sc.flags[i] & tf_format::FLAG_IS_BUYER_MAKER != 0 {
+            (0.0, sc.qty[i])
+        } else {
+            (sc.qty[i], 0.0)
+        };
+        if bars.last_mut().map_or(false, |b| b.bucket_start_us == bucket) {
+            let b = bars.last_mut().unwrap();
+            b.high = b.high.max(sc.price[i]);
+            b.low = b.low.min(sc.price[i]);
+            b.close = sc.price[i];
+            b.base_vol += sc.qty[i];
+            b.quote_vol += sc.quote_qty[i];
+            b.trades += 1;
+            b.buy_base += buy;
+            b.sell_base += sell;
+        } else {
+            bars.push(tf_engine::Bar {
+                bucket_start_us: bucket,
+                open: sc.price[i],
+                high: sc.price[i],
+                low: sc.price[i],
+                close: sc.price[i],
+                base_vol: sc.qty[i],
+                quote_vol: sc.quote_qty[i],
+                trades: 1,
+                buy_base: buy,
+                sell_base: sell,
+            });
+        }
+    }
+
+    let event_span_us = prev_ts.unwrap_or(from) - sc.ts.first().copied().unwrap_or(from);
+    let expected_paced_us = event_span_us as f64 / sp.unwrap_or(f64::INFINITY);
+    let wrote = if let (Some(p), Some(_)) = (&out, resample_secs) {
+        write_bars_parquet(p, &bars)?
+    } else {
+        false
+    };
+
+    println!(
+        "events={} bars={} speed={} wall_ms={} slept_ms={} event_ms={} pacing_x={:.2} gaps_skipped={} bars_written={}",
+        sc.row_count(),
+        bars.len(),
+        sp.unwrap_or(0.0),
+        started.elapsed().as_millis(),
+        slept.as_millis(),
+        expected_paced_us / 1000.0,
+        if expected_paced_us.is_infinite() { 0.0 } else {
+            slept.as_micros() as f64 / expected_paced_us
+        },
+        gaps_skipped,
+        if wrote { "parquet" } else { "none" },
+    );
+    Ok(())
+}
+
+/// Cap on paced gaps so old data replays don't stall the demo for minutes.
+/// Replays above this stretch are jumped (counted in `gaps_skipped`).
+const MAX_PACED_GAP_SEC: i64 = 10;
+
+/// Sleep the pacing delay for one event gap at `speed`, clamped to sane bounds.
+/// Per-event gaps are microseconds at spot granularity, so caller-side debt
+/// accumulation isn't needed for max-rate runs (speed=0 sleeps nothing).
+fn sleep_for(gap_us: i64, speed: f64) -> std::time::Duration {
+    let d = std::time::Duration::from_micros(((gap_us as f64 / speed) as u64).min(MAX_SLEEP_MS * 1000));
+    if !d.is_zero() {
+        std::thread::sleep(d);
+    }
+    d
+}
+const MAX_SLEEP_MS: u64 = 2_500;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::IngestNorm { input, out, chunk_rows } => ingest_norm(input, out, chunk_rows),
         Cmd::Roundtrip { mkt, input } => roundtrip(mkt, input),
         Cmd::Query { mkt, from, to, resample, out } => query(mkt, from, to, resample, out),
+        Cmd::Replay { mkt, from, to, speed, resample, out } => {
+            replay(mkt, from, to, speed, resample, out)
+        }
     }
 }
