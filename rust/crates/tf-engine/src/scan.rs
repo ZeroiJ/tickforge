@@ -1,11 +1,11 @@
-//! Time-range scans (`ts BETWEEN t1 AND t2`) — the Phase 3 pruning proof.
+﻿//! Time-range scans (`ts BETWEEN t1 AND t2`) â€” the Phase 3 pruning proof.
 //!
 //! Pruning is two-leveled:
 //! * chunk level: a chunk overlaps the window iff its stored ts min/max overlap
-//!   (`MktFile::chunks_for_ts_range`) — all other chunks are skipped *without*
+//!   (`MktFile::chunks_for_ts_range`) â€” all other chunks are skipped *without*
 //!   their payload bytes being touched;
 //! * row level: inside the overlapping chunks, rows are filtered by
-//!   `t1 <= ts <= t2` (both inclusive; timestamps are canonical µs).
+//!   `t1 <= ts <= t2` (both inclusive; timestamps are canonical Âµs).
 
 use tf_format::{ColData, MktFile, COL_FLAGS, COL_PRICE, COL_QTY, COL_QUOTE_QTY, COL_TRADE_ID, COL_TS};
 use tf_format::error::MktError;
@@ -25,6 +25,9 @@ impl Scanned {
     pub fn row_count(&self) -> usize {
         self.ts.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.ts.is_empty()
+    }
 }
 
 /// Evidence for the honest benchmark table (docs/benchmarks.md): how much we
@@ -41,17 +44,39 @@ pub struct ScanStats {
     pub rows_emitted: usize,
 }
 
-/// Scan `f` for events with `t1 <= ts <= t2` (inclusive, µs).
+/// Scan `f` for events with `t1 <= ts <= t2` (inclusive, Âµs).
 pub fn scan_ts_range(f: &MktFile, t1: i64, t2: i64) -> Result<(Scanned, ScanStats), MktError> {
-    let candidates = f.chunks_for_ts_range(t1, t2)?;
-    let total_ts_chunks = f.n_chunks(COL_TS)?;
-
     let mut out = Scanned::default();
+    let mut stats = for_each_window_chunk(f, t1, t2, |mut part| {
+        out.ts.append(&mut part.ts);
+        out.trade_id.append(&mut part.trade_id);
+        out.price.append(&mut part.price);
+        out.qty.append(&mut part.qty);
+        out.quote_qty.append(&mut part.quote_qty);
+        out.flags.append(&mut part.flags);
+        Ok(())
+    })?;
+    stats.rows_emitted = out.row_count();
+    Ok((out, stats))
+}
+
+/// Streaming scan (Phase 3 / Drill 5): the chunk-level sibling of
+/// [`scan_ts_range`]. Emits one row-filtered [`Scanned`] per overlapping chunk
+/// and touches NOTHING else â€” peak memory stays at one â‰¤10â¶-row chunk (~40MB
+/// window of column vectors) no matter how big the file set is. This is the
+/// RAM-by-construction lever.
+pub fn for_each_window_chunk<F>(f: &MktFile, t1: i64, t2: i64, mut emit: F) -> Result<ScanStats, MktError>
+where
+    F: FnMut(Scanned) -> Result<(), MktError>,
+{
+    let candidates = f.chunks_for_ts_range(t1, t2)?;
+    let total = f.n_chunks(COL_TS)?;
+    let mut chunks_scanned = 0usize;
+    let mut chunks_skipped = total - candidates.len();
     let mut rows_decoded = 0usize;
+    let mut rows_emitted = 0usize;
 
     for &chunk in &candidates {
-        // chunk boundaries are aligned across columns (spec §3), so chunk k of
-        // every column holds the same row slice.
         let ts = col_i64(f.decode_chunk(COL_TS, chunk)?)?;
         let trade_id = col_i64(f.decode_chunk(COL_TRADE_ID, chunk)?)?;
         let price = col_f64(f.decode_chunk(COL_PRICE, chunk)?)?;
@@ -63,6 +88,8 @@ pub fn scan_ts_range(f: &MktFile, t1: i64, t2: i64) -> Result<(Scanned, ScanStat
         };
 
         rows_decoded += ts.len();
+        chunks_scanned += 1;
+        let mut part = Scanned::default();
         for i in 0..ts.len() {
             if ts[i] > t2 {
                 // file rows are time-ascending; everything after is out of window
@@ -71,22 +98,26 @@ pub fn scan_ts_range(f: &MktFile, t1: i64, t2: i64) -> Result<(Scanned, ScanStat
             if ts[i] < t1 {
                 continue;
             }
-            out.ts.push(ts[i]);
-            out.trade_id.push(trade_id[i]);
-            out.price.push(price[i]);
-            out.qty.push(qty[i]);
-            out.quote_qty.push(quote_qty[i]);
-            out.flags.push(flags[i]);
+            part.ts.push(ts[i]);
+            part.trade_id.push(trade_id[i]);
+            part.price.push(price[i]);
+            part.qty.push(qty[i]);
+            part.quote_qty.push(quote_qty[i]);
+            part.flags.push(flags[i]);
         }
+        if !part.is_empty() {
+            rows_emitted += part.row_count();
+            emit(part)?;
+        }
+        // chunk-level drop: vectors go out of scope here (DRAM peak = one chunk)
     }
 
-    let stats = ScanStats {
-        chunks_scanned: candidates.len(),
-        chunks_skipped: total_ts_chunks - candidates.len(),
-        rows_decoded,
-        rows_emitted: out.row_count(),
-    };
-    Ok((out, stats))
+    Ok(ScanStats {
+        chunks_scanned: chunks_scanned,
+        chunks_skipped: chunks_skipped,
+        rows_decoded: rows_decoded,
+        rows_emitted: rows_emitted,
+    })
 }
 
 /// [`scan_ts_range`] bound to an open file, for call-site ergonomics.

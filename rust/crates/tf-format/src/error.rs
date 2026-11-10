@@ -31,6 +31,9 @@ pub enum MktError {
     #[error("invalid writer input: {0}")]
     InvalidInput(String),
 
+    #[error("engine error: {0}")]
+    Other(String),
+
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
 

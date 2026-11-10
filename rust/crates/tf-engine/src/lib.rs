@@ -18,7 +18,7 @@ pub mod scan;
 
 pub use pipeline::{DedupStats, OrderStats, RowTable, dedup};
 pub use resample::{Bar, resample};
-pub use scan::{Engine, Scanned, ScanStats, scan_ts_range};
+pub use scan::{Engine, Scanned, ScanStats, for_each_window_chunk, scan_ts_range};
 
 /// Time ORDER stats for a scan window (events are always sorted in file order).
 pub const US_PER_SEC: i64 = 1_000_000;

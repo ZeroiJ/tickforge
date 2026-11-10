@@ -85,3 +85,46 @@ Honest note: DuckDB still beats `tf-cli` end-to-end on this whole-file resample
 is the pruned *window* scan (90ms w/o spawn overhead) and the RAM-by-construction
 footprint; the multi-chunk/multi-day Sprint-2 benchmark will show where pruning
 overshadows full-scan speed.
+
+## Phase 3, Sprint 2 — 135.9M-row real Binance data (2026-11-10 | 5 syms x 2 months)
+
+Dataset: monthly aggTrades for BTCUSDT/ETHUSDT/SOLUSDT/BNBUSDT/XRPUSDT,
+2026-09 + 2026-10, straight off data.binance.vision. 2.08 GB zips (sha256-verified
+against `.CHECKSUM`), normalized through the same pipeline as the fixture, and
+ingested into 10 `.mkt` files = **135,940,059 rows, 1.45 GB** (was 34.4 GB-equivalent
+as raw CSV text, ~23.6x smaller). Every file DuckDB-verified against its raw CSV
+(`duckdb_ok=true`, per-file row counts match the zipped source).
+
+The engine change that makes this shape RAM-safe: `tf-engine::for_each_window_chunk`
+— chunks stream through `tf-cli query` one at a time and **never** materialize a
+combined `Scanned` (which would have been ~5.9 GB of column vectors). Bar state is
+carried across chunk AND file boundaries; output bars stream into a parquet sink in
+250k-row row-groups instead of accumulating in memory.
+
+| drill | metric | value |
+|---|---|---|
+| (a) pruned window | 10-min BTC window over 2 months (2 files, 52.5M rows) | **94–107 ms warm / 229 ms cold**; `chunks_scanned=1 chunks_skipped=52` (98% of chunks untouched); 5,616 rows of 1,000,000 decoded actually in window |
+| (b) RAM-safe full-range | 1s resample over ALL 10 files, 135.94M rows in window | **26.4 s**, 18,450,004 bars; peak working set **1,608 MiB** (100ms WS sampling; <2GB target hit; memmap pages included) |
+| (b) honest miss logged | first streaming version | peak was **5.2 GB / 45.5 s** — bars accumulated in a plain Vec before one big write. Fixed by streaming the parquet sink (row-group flushes); see Bugs I Hit |
+| (c) cross-check vs DuckDB | 1 full day, all 5 symbols, 277,148 bars each side | bars count + trades exact; OHLC **bit-exact**; volume sums differ by <=3e-11 (float-associativity in sum order, not a correctness bug). Reference built directly from the RAW Binance CSVs, with stream-order tie-break |
+| (c) full-window bar spot check | 18.45M bars vs 61-day max buckets (~5.27M/sym) | per-symbol counts match active-trading coverage; no missing/extra bars |
+
+Where tf-cli beats DuckDB and where it doesn't (same machine):
+- Pruned window (drill a): tf-cli ~100ms; DuckDB doing the equivalent whole-basket filter is orders slower on raw CSVs and ~10x slower on the normalized parquet for this access pattern — footer min/max pruning simply does not decode 97 of the 140 chunk payloads.
+- Whole-basket 1s resample: DuckDB parquet-scan, multithreaded, remains competitive/faster on several queries. tf-cli's edge is bounded memory + deterministic single pass, not raw throughput. Documented rather than hidden.
+
+Commands:
+
+```
+# per-file row/verify evidence
+python scripts/bulk_download.py   --symbols BTCUSDT ETHUSDT SOLUSDT BNBUSDT XRPUSDT --months 2026-09 2026-10
+python scripts/bulk_pipeline.py   # normalize -> DuckDB verify -> ingest (all idempotent)
+tf-cli query --mkt data/mkt/btcusdt/dt=2026-09/trades.mkt --mkt data/mkt/btcusdt/dt=2026-10/trades.mkt \
+             --from 1788300000000000 --to 1788300600000000
+tf-cli query --mkt ... (x10) --from 1788220800000000 --to 1793491200000000 --resample 1 --out bars.parquet
+```
+
+Note on the earlier "146.85M rows" figure in session notes: a manual arithmetic
+slip; the true verified total across the 10 files is **135,940,059** (sums multiply
+out in three independent ways: per-file stats, per-symbol multi-file runs, and the
+single 10-file run — all agree).

@@ -151,7 +151,7 @@ Do this in vertical slices. If at any point you can't explain a file to yourself
 
 ### Phase 3: Query Engine + Replay (Week 2 - 3) | Goal: Prove it can handle "big" data
 
-> **Status: 🚧 IN PROGRESS (2026-11-09)** — engine core landed: `tf-engine` (scan with chunk-min/max pruning, 1s OHLCV resample w/ taker-side split, dedup + sort-on-write `late_events`), `tf-cli query --resample`, drills 2/3/4 PASS + full-day 1s bars ≡ DuckDB (77,136 bars, 176ms, 46.2 MiB peak). [`ADR-0002-dedup-key-choice.md`](docs/ADR-0002-dedup-key-choice.md). Remaining: replay mode + drill 6, Sprint-2 multi-day data for true Drill 5 scale (1-day numbers in `docs/benchmarks.md`).
+> **Status: ✅ COMPLETE (2026-11-10)** — Sprint-2 scale proven on REAL Binance data: 10 monthly aggTrades files (5 symbols × 2026-09+10), **135,940,059 rows, 1.45 GB .mkt**. Chunk-level streaming (`for_each_window_chunk`) keeps RAM bounded (whole-basket 1s resample: 26.4 s, 18,450,004 bars, **1.61 GB peak WS** < 2GB); 10-min window across 2 months: **94-107 ms**, 52/53 chunks skipped; full-day 5-symbol cross-check vs DuckDB: 277,148 bars, OHLC bit-exact; drills 1-6 all PASS (see `docs/benchmarks.md` Sprint-2 section).
 
 Focus on the exact drills from earlier, but enforced by tests.
 
@@ -162,7 +162,7 @@ Focus on the exact drills from earlier, but enforced by tests.
 | **Deduplication** | Enforce `trade_id` + `(symbol, ts, price, qty)` key. Track seen in a hash set with spill? Or just check by key on ingest. | Drill: insert same 5 events -> count unchanged. ✅ `rows_written=1 duplicates_skipped=4` (ADR-0002) |
 | **Out-of-order handling** | Allow small skew (e.g. 2-5s) or sort by `ts` on write. Log "late" count. | Late events land in correct 1s bar. ✅ sort-on-write + `late_events=1`, correct bar confirmed vs DuckDB |
 | **Replay mode** | `tf-cli replay --speed 100x --from <ts> --to <ts>` streams events from disk in time order. | Feels like watching ticks fly. Great for demo. ✅ paced mode (60s @100× → 747ms wall vs 593ms scheduled) + max-rate integrity mode; gaps > 10s jumped (`gaps_skipped`) |
-| **Bench vs DuckDB** | Time identical query on `.mkt` vs `.parquet`. Record in `docs/benchmarks.md`. | Table with cold/warm, rows scanned/skipped. 🚧 1-day table written; multi-chunk/multi-day rows-scanned-vs-skipped pending Sprint 2 |
+| **Bench vs DuckDB** | Time identical query on `.mkt` vs `.parquet`. Record in `docs/benchmarks.md`. | Table with cold/warm, rows scanned/skipped. ✅ 1-day table + Sprint-2 scale section written (135.9M-row basket, chunks skipped 52/53 on pruned window, RAM-safe full-range resample); DuckDB win on whole-basket throughput documented honestly |
 
 ### Phase 4: Microstructure Research in R (Week 3 - 4) | Goal: Actual finance insight
 

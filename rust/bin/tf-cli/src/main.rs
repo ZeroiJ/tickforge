@@ -1,11 +1,11 @@
-//! `tf-cli` — the single tickforge binary.
+﻿//! `tf-cli` â€” the single tickforge binary.
 //!
 //! Phase 2 surface (plan.md):
-//! - `ingest-norm`  : normalized canonical Parquet → `.mkt` (atomic, idempotent, sha-keyed)
-//! - `roundtrip`    : decode `.mkt` back and compare to Parquet values bitwise (spec §7 proof)
+//! - `ingest-norm`  : normalized canonical Parquet â†’ `.mkt` (atomic, idempotent, sha-keyed)
+//! - `roundtrip`    : decode `.mkt` back and compare to Parquet values bitwise (spec Â§7 proof)
 //! Phase 3 surface (plan.md):
 //! - `query`        : time-range scan on `.mkt` (chunk pruning) + optional OHLCV
-//!                    resample → bars parquet (Drills 5/6 material)
+//!                    resample â†’ bars parquet (Drills 5/6 material)
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -58,11 +58,12 @@ enum Cmd {
         #[arg(short, long)]
         input: PathBuf,
     },
-    /// Time-range scan + optional OHLCV resample over a `.mkt` file (Phase 3).
+    /// Time-range scan + optional OHLCV resample over one or more `.mkt` files
+    /// (Phase 3; multi-file = Drill 5's 24h/5-symbol shape).
     Query {
-        /// The .mkt file to scan.
-        #[arg(short, long)]
-        mkt: PathBuf,
+        /// The .mkt file(s) to scan (repeat the flag for multiple files).
+        #[arg(short, long = "mkt")]
+        mkt: Vec<PathBuf>,
         /// Window start, inclusive, canonical microseconds.
         #[arg(long)]
         from: i64,
@@ -78,7 +79,7 @@ enum Cmd {
     },
     /// Stream events from disk in time order (Phase 3 replay / Drill 6).
     ///
-    /// `--speed N` paces the stream N× real time (event-d.UTC spacing / N);
+    /// `--speed N` paces the stream NÃ— real time (event-d.UTC spacing / N);
     /// omit (`--speed 0`) for max-rate integrity mode: the streamed path
     /// aggregates bars incrementally and they must equal `query --resample`s
     /// full-pass bars exactly.
@@ -178,7 +179,7 @@ impl Canonical {
 
             for j in 0..b.num_rows() {
                 if trade.is_null(j) || ts_arr.is_null(j) || price_arr.is_null(j) || qty_arr.is_null(j) {
-                    return Err(format!("null in key column at row {} — contract violation", trade_id.len()).into());
+                    return Err(format!("null in key column at row {} â€” contract violation", trade_id.len()).into());
                 }
                 if !bm.is_null(j) && !best.is_null(j) {
                     let mut f = 0u8;
@@ -202,7 +203,7 @@ impl Canonical {
         }
         if symbols.len() > 1 {
             return Err(format!(
-                "file contains multiple symbols {symbols:?} — one .mkt file per (symbol, day)"
+                "file contains multiple symbols {symbols:?} â€” one .mkt file per (symbol, day)"
             ).into());
         }
         let symbol = symbols.pop_first().ok_or("empty input")?;
@@ -248,7 +249,7 @@ fn ingest_norm(input: PathBuf, out: Option<PathBuf>, chunk_rows: Option<u32>) ->
     }
 
     // ---- Phase 3 gate: dedup + time-ordering (Drills 3 & 4, ADR-0002) -------
-    // On day-scale data (≤ ~1M rows/symbol-day) the row-table build + sort is
+    // On day-scale data (â‰¤ ~1M rows/symbol-day) the row-table build + sort is
     // memory-trivial and keeps the `.mkt` write path time-ascending by contract.
     let mut rows = RowTable {
         trade_id: canon.trade_id.clone(),
@@ -405,25 +406,171 @@ fn chunk_start(f: &MktFile, col: u8, chunk: usize) -> u64 {
     f.col(col).map(|c| c.chunks[chunk].start_row).unwrap_or(0)
 }
 
-// ---- Phase 3: query + resample ----------------------------------------------
+// ---- Phase 3: query + resample (multi-file) ---------------------------------
+// ---- Phase 3: query + resample (multi-file) ---------------------------------
+
+/// Aggregate scan evidence across files (Drill-5 proof: files/chunks skipped,
+/// rows decoded vs emitted).
+#[derive(Default, Clone, Copy)]
+struct AggStats {
+    files_scanned: usize,
+    files_skipped: usize,
+    chunks_scanned: usize,
+    chunks_skipped: usize,
+    rows_decoded: usize,
+    rows_emitted: usize,
+}
+
+/// Open every --mkt file, infer the symbol from the canonical layout
+/// `data/mkt/<symbol>/dt=<period>/trades.mkt`, and group per symbol:
+/// files inside one symbol are ordered by ts_min and must be time-disjoint
+/// (sort-on-write contract, ADR-0002); different symbols overlap in time by
+/// definition and are streamed one after another as independent streams.
+fn open_grouped(mkt: &[PathBuf]) -> Result<Vec<(MktFile, PathBuf, String)>, Box<dyn Error>> {
+    let mut files: Vec<(MktFile, PathBuf, String)> = mkt
+        .iter()
+        .map(|p| {
+            let sym = p
+                .parent()
+                .and_then(|d| d.parent())
+                .and_then(|d| d.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "default".to_string());
+            Ok((MktFile::open(p)?, p.clone(), sym))
+        })
+        .collect::<Result<_, Box<dyn Error>>>()?;
+    files.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.meta.ts_min.cmp(&b.0.meta.ts_min)));
+    let groups = group_bounds(&files);
+    for (s, e) in groups.windows(2).map(|w| (w[0], w[1])) {
+        for w in files[s..e].windows(2) {
+            if w[0].0.meta.ts_max >= w[1].0.meta.ts_min {
+                return Err(format!(
+                    "files overlap in time (same symbol): {} [{}..{}] vs {} [{}..{}] -- require disjoint (symbol, day|month) partitions",
+                    w[0].1.display(), w[0].0.meta.ts_min, w[0].0.meta.ts_max,
+                    w[1].1.display(), w[1].0.meta.ts_min, w[1].0.meta.ts_max,
+                ).into());
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Indices where the symbol changes (plus the end index) â€” group boundaries.
+fn group_bounds(files: &[(MktFile, PathBuf, String)]) -> Vec<usize> {
+    let mut bounds = vec![0usize];
+    for i in 1..files.len() {
+        if files[i].2 != files[i - 1].2 {
+            bounds.push(i);
+        }
+    }
+    bounds.push(files.len());
+    bounds
+}
 
 fn query(
-    mkt: PathBuf,
+    mkt: Vec<PathBuf>,
     from: i64,
     to: i64,
     resample_secs: Option<u64>,
     out: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
-    let f = MktFile::open(&mkt)?;
+    if mkt.is_empty() {
+        return Err("query: no --mkt given".into());
+    }
     let t0 = std::time::Instant::now();
-    let (sc, st) = tf_engine::scan_ts_range(&f, from, to)?;
+    let files = open_grouped(&mkt)?;
+    let groups = group_bounds(&files);
 
-    if sc.row_count() == 0 {
+    // Streaming path (Drill 5 RAM contract): never materialize a full Scanned
+    // across all files (~5.9GB for the Sprint-2 set, 146.85M rows). Chunks
+    // stream through one at a time (~40MB); we keep only aggregation output:
+    //   - resample: one symbol-tagged bar stream per symbol group; the open
+    //     bar is carried across chunk boundaries AND successive files of the
+    //     same symbol, and reset between symbols.
+    //   - count mode: rows summed from per-chunk ScanStats, no vectors kept.
+    let mut stats = AggStats::default();
+    let mut sink = BarSink::new(out.as_deref().filter(|_| resample_secs.is_some()))?;
+    let mut cur: Option<tf_engine::Bar> = None;
+    let bucket_us = resample_secs.unwrap_or(1).max(1) as i64 * 1_000_000;
+    let flush_cur = |cur: &mut Option<tf_engine::Bar>,
+                     sink: &mut BarSink,
+                     sym: &str|
+        -> Result<(), Box<dyn Error>> {
+        if let Some(b) = cur.take() {
+            sink.push(sym, b)?;
+        }
+        Ok(())
+    };
+
+    for gi in 0..(groups.len() - 1) {
+        let sym = files[groups[gi]].2.clone();
+        for (f, _path, _s) in &files[groups[gi]..groups[gi + 1]] {
+            if to < f.meta.ts_min || from > f.meta.ts_max {
+                stats.files_skipped += 1;
+                stats.chunks_skipped += f.n_chunks(COL_TS)?;
+                continue;
+            }
+            let st = tf_engine::for_each_window_chunk(f, from, to, |part| {
+                let sink = &mut sink;
+                match resample_secs {
+                    None => Ok(()), // count-only: rows come back via st.rows_emitted
+                    Some(_) => {
+                        for i in 0..part.ts.len() {
+                            let bucket = part.ts[i] - part.ts[i].rem_euclid(bucket_us);
+                            if cur.as_ref().is_some_and(|b| b.bucket_start_us == bucket) {
+                                let b = cur.as_mut().unwrap();
+                                b.high = b.high.max(part.price[i]);
+                                b.low = b.low.min(part.price[i]);
+                                b.close = part.price[i];
+                                b.base_vol += part.qty[i];
+                                b.quote_vol += part.quote_qty[i];
+                                b.trades += 1;
+                                if part.flags[i] & tf_format::FLAG_IS_BUYER_MAKER != 0 {
+                                    b.sell_base += part.qty[i];
+                                } else {
+                                    b.buy_base += part.qty[i];
+                                }
+                            } else {
+                                flush_cur(&mut cur, &mut *sink, &sym)
+                                    .map_err(|e| tf_format::error::MktError::Other(e.to_string()))?;
+                                let is_buyer_maker =
+                                    part.flags[i] & tf_format::FLAG_IS_BUYER_MAKER != 0;
+                                cur = Some(tf_engine::Bar {
+                                    bucket_start_us: bucket,
+                                    open: part.price[i],
+                                    high: part.price[i],
+                                    low: part.price[i],
+                                    close: part.price[i],
+                                    base_vol: part.qty[i],
+                                    quote_vol: part.quote_qty[i],
+                                    trades: 1,
+                                    buy_base: if is_buyer_maker { 0.0 } else { part.qty[i] },
+                                    sell_base: if is_buyer_maker { part.qty[i] } else { 0.0 },
+                                });
+                            }
+                        }
+                        Ok(())
+                    }
+                }
+            })?;
+            stats.chunks_scanned += st.chunks_scanned;
+            stats.chunks_skipped += st.chunks_skipped;
+            stats.rows_decoded += st.rows_decoded;
+            stats.rows_emitted += st.rows_emitted;
+            stats.files_scanned += 1;
+        }
+        // symbol boundary: the open bar must not leak into the next stream
+        flush_cur(&mut cur, &mut sink, &sym)?;
+    }
+    let bars_total = sink.total;
+    let (min_bucket, max_bucket) = (sink.min_bucket, sink.max_bucket);
+    let bars_written = sink.close()?;
+
+    if stats.rows_emitted == 0 {
         println!(
-            "rows_emitted=0 chunks_scanned={} chunks_skipped={} elapsed_ms={}",
-            st.chunks_scanned,
-            st.chunks_skipped,
-            t0.elapsed().as_millis()
+            "files={} files_scanned={} files_skipped={} chunks_scanned={} chunks_skipped={} rows_emitted=0 elapsed_ms={}",
+            files.len(), stats.files_scanned, stats.files_skipped,
+            stats.chunks_scanned, stats.chunks_skipped, t0.elapsed().as_millis()
         );
         return Ok(());
     }
@@ -431,50 +578,129 @@ fn query(
     match resample_secs {
         None => {
             println!(
-                "rows_emitted={} chunks_scanned={} chunks_skipped={} rows_decoded={} elapsed_ms={} ts_range=[{},{}]",
-                st.rows_emitted,
-                st.chunks_scanned,
-                st.chunks_skipped,
-                st.rows_decoded,
-                t0.elapsed().as_millis(),
-                sc.ts[0],
-                sc.ts[sc.row_count() - 1]
+                "files={} files_scanned={} files_skipped={} chunks_scanned={} chunks_skipped={} rows_emitted={} rows_decoded={} elapsed_ms={}",
+                files.len(), stats.files_scanned, stats.files_skipped,
+                stats.chunks_scanned, stats.chunks_skipped,
+                stats.rows_emitted, stats.rows_decoded, t0.elapsed().as_millis()
             );
         }
         Some(secs) => {
-            let bars = tf_engine::resample(&sc, secs);
-            let wrote = if let Some(p) = &out { write_bars_parquet(p, &bars)? } else { false };
+            let wrote = bars_written > 0 && out.is_some();
             println!(
-                "bars={} bucket_sec={} rows_emitted={} chunks_scanned={} chunks_skipped={} elapsed_ms={} bars_range=[{},{}] bars_written={}",
-                bars.len(),
-                secs,
-                st.rows_emitted,
-                st.chunks_scanned,
-                st.chunks_skipped,
-                t0.elapsed().as_millis(),
-                bars[0].bucket_start_us,
-                bars[bars.len() - 1].bucket_start_us,
+                "files={} files_scanned={} files_skipped={} chunks_scanned={} chunks_skipped={} bars={} bucket_sec={} rows_emitted={} elapsed_ms={} bars_range=[{},{}] bars_written={}",
+                files.len(), stats.files_scanned, stats.files_skipped,
+                stats.chunks_scanned, stats.chunks_skipped, bars_total, secs,
+                stats.rows_emitted, t0.elapsed().as_millis(), min_bucket, max_bucket,
                 if wrote { "parquet" } else { "stdout-only" }
             );
-            if out.is_none() {
-                for b in bars.iter().take(3) {
-                    println!(
-                        "bar ts={} open={} high={} low={} close={} vol={} trades={}",
-                        b.bucket_start_us, b.open, b.high, b.low, b.close, b.base_vol, b.trades
-                    );
-                }
-            }
         }
     }
     Ok(())
 }
 
 fn write_bars_parquet(path: &Path, bars: &[tf_engine::Bar]) -> Result<bool, Box<dyn Error>> {
-    use arrow_array::{Int64Array, RecordBatch};
-    use parquet::arrow::ArrowWriter;
-    use std::sync::Arc;
+    let tagged: Vec<(String, tf_engine::Bar)> =
+        bars.iter().map(|b| ("default".to_string(), b.clone())).collect();
+    write_bars_sym_parquet(path, &tagged)
+}
 
-    let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+/// Incremental bar sink (Drill 5 RAM contract): acculates at most
+/// `FLUSH_EVERY` bars in memory, then writes them as one parquet row group.
+/// 18.45M bars streamed through a ≤1M-row buffer instead of a 2GB+ Vec.
+pub struct BarSink {
+    writer: Option<parquet::arrow::ArrowWriter<File>>,
+    path: PathBuf,
+    buf: Vec<(String, tf_engine::Bar)>,
+    pub total: usize,
+    pub min_bucket: i64,
+    pub max_bucket: i64,
+}
+
+const FLUSH_EVERY: usize = 250_000; // ~25MB batch worst case; keeps RAM bounded
+
+impl BarSink {
+    pub fn new(path: Option<&Path>) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            writer: None,
+            path: path.map(|p| p.to_path_buf()).unwrap_or(PathBuf::from("")),
+            buf: Vec::new(),
+            total: 0,
+            min_bucket: i64::MAX,
+            max_bucket: i64::MIN,
+        })
+    }
+
+    pub fn push(&mut self, sym: &str, b: tf_engine::Bar) -> Result<(), Box<dyn Error>> {
+        self.total += 1;
+        self.min_bucket = self.min_bucket.min(b.bucket_start_us);
+        self.max_bucket = self.max_bucket.max(b.bucket_start_us);
+        self.buf.push((sym.to_string(), b));
+        // No --out: bars are never needed downstream (stdout reports counters
+        // only), so keep the raw Vec for total/bounds and skip flushing — but
+        // resample-without-out on huge inputs is a caller-error by design.
+        if self.buffered() >= FLUSH_EVERY && !self.path.as_os_str().is_empty() {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn batch(&self) -> Result<std::sync::Arc<arrow_array::RecordBatch>, Box<dyn Error>> {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        let schema = bars_schema();
+        Ok(std::sync::Arc::new(RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from_iter_values(self.buf.iter().map(|(s, _)| s.as_str()))),
+                std::sync::Arc::new(Int64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.bucket_start_us))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.open))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.high))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.low))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.close))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.base_vol))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.quote_vol))),
+                std::sync::Arc::new(Int64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.trades as i64))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.buy_base))),
+                std::sync::Arc::new(arrow_array::Float64Array::from_iter_values(self.buf.iter().map(|(_, b)| b.sell_base))),
+            ],
+        )?))
+    }
+
+    fn flush(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.buf.is_empty() || self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let batch = self.batch()?;
+        let file = match &mut self.writer {
+            Some(w) => {
+                w.write(batch.as_ref())?;
+                self.buf = Vec::with_capacity(FLUSH_EVERY);
+                return Ok(());
+            }
+            None => File::create(&self.path)?,
+        };
+        let mut w = bars_writer(file);
+        w.write(batch.as_ref())?;
+        self.writer = Some(w);
+        self.buf = Vec::with_capacity(FLUSH_EVERY);
+        Ok(())
+    }
+
+    pub fn close(mut self) -> Result<usize, Box<dyn Error>> {
+        self.flush()?;
+        if let Some(w) = self.writer.take() {
+            w.close()?;
+        }
+        Ok(self.total)
+    }
+}
+
+fn bars_schema() -> std::sync::Arc<arrow_schema::Schema> {
+    std::sync::Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("symbol", arrow_schema::DataType::Utf8, false),
         arrow_schema::Field::new("ts_bucket", arrow_schema::DataType::Int64, false),
         arrow_schema::Field::new("open", arrow_schema::DataType::Float64, false),
         arrow_schema::Field::new("high", arrow_schema::DataType::Float64, false),
@@ -485,28 +711,33 @@ fn write_bars_parquet(path: &Path, bars: &[tf_engine::Bar]) -> Result<bool, Box<
         arrow_schema::Field::new("trades", arrow_schema::DataType::Int64, false),
         arrow_schema::Field::new("buy_base", arrow_schema::DataType::Float64, false),
         arrow_schema::Field::new("sell_base", arrow_schema::DataType::Float64, false),
-    ]));
+    ]))
+}
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from_iter_values(bars.iter().map(|b| b.bucket_start_us))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.open))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.high))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.low))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.close))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.base_vol))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.quote_vol))),
-            Arc::new(Int64Array::from_iter_values(bars.iter().map(|b| b.trades as i64))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.buy_base))),
-            Arc::new(arrow_array::Float64Array::from_iter_values(bars.iter().map(|b| b.sell_base))),
-        ],
-    )?;
+/// Small-budget writer props (Drill 5 RAM contract): small row groups and data
+/// pages so the parquet encoder itself cannot balloon the working set.
+fn bars_writer(file: File) -> parquet::arrow::ArrowWriter<File> {
+    use parquet::file::properties::WriterProperties;
+    use parquet::basic::Compression;
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(250_000))
+        .set_data_page_size_limit(512 * 1024)
+        .set_write_batch_size(64 * 1024)
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    parquet::arrow::ArrowWriter::try_new(file, bars_schema(), Some(props)).unwrap()
+}
 
-    let file = File::create(path)?;
-    let mut w = ArrowWriter::try_new(file, schema, None)?;
-    w.write(&batch)?;
-    w.close()?;
+/// Legacy one-shot writer (used by roundtrip-sized outputs and tests).
+fn write_bars_sym_parquet(
+    path: &Path,
+    bars: &[(String, tf_engine::Bar)],
+) -> Result<bool, Box<dyn Error>> {
+    let mut sink = BarSink::new(Some(path))?;
+    for (s, b) in bars {
+        sink.push(s, b.clone())?;
+    }
+    sink.close()?;
     Ok(true)
 }
 
@@ -584,7 +815,16 @@ fn replay(
     let event_span_us = prev_ts.unwrap_or(from) - sc.ts.first().copied().unwrap_or(from);
     let expected_paced_us = event_span_us as f64 / sp.unwrap_or(f64::INFINITY);
     let wrote = if let (Some(p), Some(_)) = (&out, resample_secs) {
-        write_bars_parquet(p, &bars)?
+        // tag bars with the symbol from the canonical layout, same as `query`
+        let sym = mkt
+            .parent()
+            .and_then(|d| d.parent())
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "default".to_string());
+        let tagged: Vec<(String, tf_engine::Bar)> =
+            bars.iter().map(|b| (sym.clone(), b.clone())).collect();
+        write_bars_sym_parquet(p, &tagged)?
     } else {
         false
     };

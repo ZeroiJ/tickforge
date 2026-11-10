@@ -2,7 +2,7 @@
 
 > A tick-level crypto market microstructure lab: a custom memory-mapped columnar engine (`.mkt`) that queries 100GB+ of Binance tick data with **<2GB RAM**, proved with drills — not vibes.
 
-**Status:** 🚧 **Phase 3 — queries, drills 1–6 ✅; replay done. Remaining: Sprint-2 scale (drill 5 @ 24h/5 symbols, multi-chunk bench)** *(2026-11-09: tf-engine scan/resample/dedup, tf-cli query+replay, all six drills pass — see Proofs)*
+**Status:** ✅ **Phase 3 COMPLETE — queries + drills 1–6 ✅ at Sprint-2 scale** *(2026-11-10: 135.9M-row / 5-symbol / 2-month real Binance data; drill 5 RAM-safe full-basket resample 1.61 GB peak; drill 5 cross-check vs DuckDB bit-exact OHLC; streaming multi-file query — see Proofs)*
 
 ---
 
@@ -50,7 +50,7 @@ tickforge/
 | 2 | Kill & resume mid-write, no corruption | ✅ kill mid-write → nothing at canonical path (atomic rename); rerun completes; state idempotent |
 | 3 | Deduplication (`inserted=1, dupes=4`) | ✅ 5 identical events → `rows_written=1 duplicates_skipped=4`, count unchanged (`python -m tickforge.drills`) |
 | 4 | Late/out-of-order trade lands in correct bar | ✅ late event → `late_events=1`, sole trade of its correct 1s bar; bars ≡ DuckDB |
-| 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | 🚧 1-day scale proven: full-day scan+resample peak WS **46.2 MiB**, 77,136 1s bars ≡ DuckDB; 24h/5-symbol scale pending Sprint 2 data |
+| 5 | RAM-safe scan (24h, <2GB RAM, correct vs DuckDB) | ✅ full Sprint-2 scale: **135,940,059 rows, 5 symbols × 2 months**, 10 .mkt files; whole-basket 1s resample in **26.4 s**, peak working set **1.61 GB** (<2GB); full-day cross-check **277,148 bars match DuckDB** (OHLC bit-exact) |
 | 6 | Replay integrity (1x replay bars == full-pass bars) | ✅ full-day max-rate replay → **77,136 streamed bars exactly equal** full-pass bars; paced mode verified (100×, `pacing_x=1.00`) |
 
 ## Results
@@ -77,6 +77,15 @@ tickforge/
 - drills as code: `python -m tickforge.drills` → **drills 1–6 PASS** (idempotent, kill-mid-write, dedup 1+4, late-correct-bar, DuckDB parity, replay equality + pacing)
 - design: [`ADR-0002-dedup-key-choice.md`](docs/ADR-0002-dedup-key-choice.md) · numbers: [`benchmarks.md`](docs/benchmarks.md)
 
+**Sprint 2 / Phase 3 close (2026-11-10 - 135.9M rows of REAL Binance data):**
+- downloaded 10 monthly aggTrades zips (5 symbols x 2026-09/2026-10, 2.08 GB, sha256-verified) -> normalized -> DuckDB-verified per file -> ingested into 10 `.mkt` files = **135,940,059 rows in 1.45 GB** (~23.6x smaller than raw CSV text)
+- `tf-engine` gained **chunk-level streaming** (`for_each_window_chunk`): chunks flow one at a time; the open bar is carried across chunk AND file boundaries; 135.9M rows never materialize as a ~5.9 GB combined scan buffer
+- drill 5 (a): 10-min BTC window across 2 months = **94-107 ms**, 52 of 53 chunks skipped by footer min/max
+- drill 5 (b): whole-basket 1s resample = **26.4 s, 18,450,004 bars, peak working set 1,608 MiB** (<2GB, memmap pages included)
+- drill 5 (c): full-day, all 5 symbols -> 277,148 bars per side; OHLC **bit-exact** vs DuckDB reference computed from the RAW CSVs; volume sums differ by <=3e-11 (float associativity only)
+- all six drills still PASS (`python -m tickforge.drills`) -> drills include a source-drift guard on the fixture row count
+- numbers + honest DuckDB-vs-tf-cli table: [`benchmarks.md`](docs/benchmarks.md)
+
 ## Docs
 
 - [`plan.md`](plan.md) — full roadmap, phases 0–6
@@ -92,3 +101,5 @@ tickforge/
 - **Phase 3 — DuckDB tie nondeterminism**: `last(price ORDER BY ts)` picked arbitrary rows among equal-µs aggTrades → 1341 bar mismatches vs tf bars; fixed with stream-order tiebreak (`file_row_number=true`).
 - **Phase 3 — replay pacing that never slept**: `sleep_for()` returned computed durations used only as an accumulator (`wall=0ms`, fabricated `pacing_x=1.00`); drill's wall-time assertion caught it → now really `thread::sleep`s.
 - **Phase 3 — silent source drift**: `data/norm` canonical parquet was at some point replaced by a 3-row file on disk; sha-keyed idempotency meant every downstream proof was shrinking with it. Rebuilt from the raw CSV via the Phase-1 pipeline (`normalize_day.py`, DuckDB-verified) and drill 1 now guards source row count (417,528). Lesson: idempotency checks should also assert the *source* is the expected shape.
+- **Sprint 2 - bar sink that ate 5.2 GB**: the first full-basket resample accumulated all 18.45M bars in a plain `Vec` before one big parquet write - peak working set 5.2 GB, blowing the <2GB contract exactly where the drill was aimed. Fixed by a streaming `BarSink` (250k-row flushes, small row groups, 512 KiB data pages) -> 1.61 GB. The memory was never in the scan; it was in the *output* path.
+- **Sprint 2 - drill 6 caught a tag mismatch**: bar payloads were byte-identical across query vs replay, but `polars.equals` failed on the new `symbol` column (query tagged `btcusdt` from the path, replay hardcoded a default). Fixed by inferring the symbol from the canonical layout in both paths; lesson: compare the actual parquet, not just stdout counters.
